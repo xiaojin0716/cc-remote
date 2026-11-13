@@ -12,10 +12,9 @@ index 4dc08baf1ab993b3249373564a28b7fe76b37df9..a5991fa37b1f12bf71efb8bbbf89dac3
  /**
   * Return user-message content with local-command and injected-context marker
 diff --git a/dist/acp-agent.js b/dist/acp-agent.js
-index a86e0a1f3fec00bd1d021f84ba5c50a0fb02ba77..70048efbc36c8bfc2815e96d9ae11b44f185e279 100644
 --- a/dist/acp-agent.js
 +++ b/dist/acp-agent.js
-@@ -672,6 +672,11 @@ function recoveredToolInput(prefix) {
+@@ -672,6 +672,11 @@
          return undefined;
      }
  }
@@ -27,7 +26,59 @@ index a86e0a1f3fec00bd1d021f84ba5c50a0fb02ba77..70048efbc36c8bfc2815e96d9ae11b44
  export async function claudeCliPath() {
      if (process.env.CLAUDE_CODE_EXECUTABLE) {
          return process.env.CLAUDE_CODE_EXECUTABLE;
-@@ -9240,7 +9245,7 @@ export class ClaudeAcpAgent {
+@@ -1294,6 +1299,7 @@
+         });
+     }
+     async initialize(request) {
++        this.acpcStatusLine = request.clientInfo?.name === "acpc";
+         this.clientCapabilities = request.clientCapabilities;
+         this.toolCallCapabilities = ToolCallClientCapabilities.from(request.clientCapabilities, {
+             v2: this.v2,
+@@ -2138,7 +2144,7 @@
+             events = { inserted() { }, ended: resolve, failed: reject };
+         });
+         await this.startTurn(params, events);
+-        return outcome;
++        return outcome.finally(() => { void this.refreshAcpcLimits(params.sessionId); });
+     }
+     /**
+      * Starts a turn for a prompt. Resolves once the prompt is queued for Claude
+@@ -8327,8 +8333,34 @@
+      * and the subagent states from the v2 surface once it has sent its own
+      * response (`src/v2/agent.ts`), so it gets neither here.
+      */
++    async refreshAcpcLimits(sessionId) {
++        const session = this.sessions[sessionId];
++        if (!this.acpcStatusLine || !session || Date.now() < (session.nextAcpcLimitsRead ?? 0)) return;
++        session.nextAcpcLimitsRead = Date.now() + 60_000;
++        const query = session.query;
++        let limits = null;
++        try {
++            const result = await raceTimeoutAndAbort(
++                query.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET(),
++                STRUCTURED_USAGE_TIMEOUT_MS,
++                new AbortController().signal,
++            );
++            if (result.type === "done" && result.value?.rate_limits_available) {
++                const windows = result.value.rate_limits;
++                limits = { five_hour: windows?.five_hour ?? null, seven_day: windows?.seven_day ?? null };
++            }
++        } catch {
++            // Older CLIs may not implement the structured usage request.
++        }
++        if (this.sessions[sessionId]?.query !== query) return;
++        await this.client.sessionUpdate({
++            sessionId,
++            update: { sessionUpdate: "session_info_update", _meta: { "_claude/subscriptionLimits": limits } },
++        }).catch((err) => this.logger.error("Could not publish subscription limits:", err));
++    }
+     afterSetupResponse(sessionId, mcpServers) {
+         setTimeout(() => {
++            void this.refreshAcpcLimits(sessionId);
+             if (!this.v2) {
+                 this.sendAvailableCommandsUpdate(sessionId);
+                 void this.publishCurrentSubagentStates(sessionId);
+@@ -9240,7 +9272,7 @@
          }
          const q = query({
              prompt: input,
@@ -57,3 +108,19 @@ index b162f50419b2197cf1decd8b8281c985705317c8..49d68e1daf164ead9e18c8acc39acb92
  export { nodeToWebReadable, nodeToWebWritable, Pushable, unreachable } from "./utils.js";
  export { toolInfoFromToolUse, toDisplayPath, planEntries, toolUpdateFromToolResult, } from "./tools.js";
  export { SettingsManager } from "./settings.js";
+diff --git a/dist/session-model.js b/dist/session-model.js
+--- a/dist/session-model.js
++++ b/dist/session-model.js
+@@ -206,6 +206,12 @@
+             name: info?.displayName || currentValue,
+             description: info?.description || undefined,
+         });
++    }
++    // Keep the exact ID alongside the selected alias for clients which display the running model.
++    const resolved = modelInfos.find((info) => info.value === currentValue)?.resolvedModel;
++    const selected = options.find((entry) => entry.value === currentValue);
++    if (resolved && selected) {
++        selected._meta = { ...selected._meta, "_claude/resolvedModel": resolved };
+     }
+     return {
+         id: MODEL_CONFIG_ID,
